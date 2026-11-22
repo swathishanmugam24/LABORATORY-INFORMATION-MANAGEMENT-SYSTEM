@@ -1,0 +1,1512 @@
+/* ResearchLabManagementSystemFull.java
+   Single-file Java Swing application implementing:
+    - Role-based login (Admin / Technician / Researcher)
+    - User management (Admin)
+    - Inventory management (Admin/Tech)
+    - Maintenance logs (Technician)
+    - Requests & approval workflow (Researcher -> Admin/Technician)
+    - Samples CRUD (Tech/Admin), Researcher requests to submit samples
+    - Results CRUD (Tech/Admin)
+    - Equipment reservations with scheduling conflict checks
+    - Search/filtering, colored interactive UI
+    - Persistence via Java serialization to files
+    - CSV and simple HTML export (printable)
+    - SHA-256 simple password hashing
+    - Demo credentials created on first run
+*/
+
+import javax.swing.*;
+import javax.swing.table.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.nio.file.*;
+import java.security.MessageDigest;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/* ---------------------------
+   Model classes (Serializable)
+   --------------------------- */
+class User implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String username;
+    String displayName;
+    String role; // Admin, Technician, Researcher
+    String passwordHash; // SHA-256 hash
+
+    public User(String username, String displayName, String role, String passwordHash) {
+        this.username = username;
+        this.displayName = displayName;
+        this.role = role;
+        this.passwordHash = passwordHash;
+    }
+}
+
+class Sample implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String id;
+    String name;
+    String collectedBy; // username
+    String status; // Received, In Analysis, Completed, Discarded
+    LocalDateTime collectedAt;
+    String project; // optional project or purpose
+
+    public Sample(String id, String name, String collectedBy, String status, LocalDateTime collectedAt, String project) {
+        this.id = id; this.name = name; this.collectedBy = collectedBy; this.status = status; this.collectedAt = collectedAt; this.project = project;
+    }
+}
+
+class Result implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String id;
+    String sampleId;
+    String value;
+    String recordedBy;
+    LocalDateTime recordedAt;
+    String notes;
+
+    public Result(String id, String sampleId, String value, String recordedBy, LocalDateTime recordedAt, String notes) {
+        this.id = id; this.sampleId = sampleId; this.value = value; this.recordedBy = recordedBy; this.recordedAt = recordedAt; this.notes = notes;
+    }
+}
+
+class InventoryItem implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String id;
+    String name;
+    String category; // chemical, equipment, consumable
+    int stock;
+    String location;
+    String notes;
+
+    public InventoryItem(String id, String name, String category, int stock, String location, String notes) {
+        this.id = id; this.name = name; this.category = category; this.stock = stock; this.location = location; this.notes = notes;
+    }
+}
+
+class MaintenanceLog implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String id;
+    String equipmentId; // inventory id
+    String doneBy;
+    LocalDateTime date;
+    String notes;
+
+    public MaintenanceLog(String id, String equipmentId, String doneBy, LocalDateTime date, String notes) {
+        this.id = id; this.equipmentId = equipmentId; this.doneBy = doneBy; this.date = date; this.notes = notes;
+    }
+}
+
+class EquipmentReservation implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String id;
+    String equipmentId; // inventory id
+    String reservedBy;
+    LocalDateTime start;
+    LocalDateTime end;
+    String purpose;
+    String status; // Pending, Approved, Rejected
+
+    public EquipmentReservation(String id, String equipmentId, String reservedBy, LocalDateTime start, LocalDateTime end, String purpose, String status) {
+        this.id = id; this.equipmentId = equipmentId; this.reservedBy = reservedBy; this.start = start; this.end = end; this.purpose = purpose; this.status = status;
+    }
+}
+
+class RequestItem implements Serializable {
+    private static final long serialVersionUID = 1L;
+    String id;
+    String requestedBy;
+    String type; // "Equipment", "Sample", "Chemical"
+    String targetId; // equipmentId or sampleId or inventoryId
+    String details; // description
+    String status; // Pending, Approved, Rejected
+    LocalDateTime requestedAt;
+    LocalDateTime resolvedAt;
+    String resolvedBy;
+    String resolutionNotes;
+
+    public RequestItem(String id, String requestedBy, String type, String targetId, String details, String status, LocalDateTime requestedAt) {
+        this.id = id; this.requestedBy = requestedBy; this.type = type; this.targetId = targetId; this.details = details; this.status = status; this.requestedAt = requestedAt;
+    }
+}
+
+class AuditLog implements Serializable {
+    private static final long serialVersionUID = 1L;
+    LocalDateTime time;
+    String user;
+    String action;
+
+    public AuditLog(LocalDateTime time, String user, String action) {
+        this.time = time; this.user = user; this.action = action;
+    }
+}
+
+/* -----------------------------
+   Simple persistence utility
+   ----------------------------- */
+class Serializer {
+    public static <T> void saveList(List<T> list, String filename) {
+        try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(filename))) {
+            out.writeObject(list);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            JOptionPane.showMessageDialog(null, "Save failed: " + filename + "\n" + ex.getMessage(), "Save Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+    @SuppressWarnings("unchecked")
+    public static <T> List<T> loadList(String filename) {
+        File f = new File(filename);
+        if (!f.exists()) return new ArrayList<>();
+        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream(filename))) {
+            return (List<T>) in.readObject();
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            JOptionPane.showMessageDialog(null, "Load failed: " + filename + "\n" + ex.getMessage(), "Load Error", JOptionPane.ERROR_MESSAGE);
+            return new ArrayList<>();
+        }
+    }
+}
+
+/* -----------------------------
+   Main application frame
+   ----------------------------- */
+public class ResearchLabManagementSystemFull extends JFrame {
+    // persistence files
+    private static final String USERS_FILE = "users.dat";
+    private static final String SAMPLES_FILE = "samples.dat";
+    private static final String RESULTS_FILE = "results.dat";
+    private static final String INVENTORY_FILE = "inventory.dat";
+    private static final String MAINT_FILE = "maintenance.dat";
+    private static final String RESERV_FILE = "reservations.dat";
+    private static final String REQUESTS_FILE = "requests.dat";
+    private static final String LOGS_FILE = "logs.dat";
+
+    // in-memory lists
+    List<User> users;
+    List<Sample> samples;
+    List<Result> results;
+    List<InventoryItem> inventory;
+    List<MaintenanceLog> maintenanceLogs;
+    List<EquipmentReservation> reservations;
+    List<RequestItem> requests;
+    List<AuditLog> logs;
+
+    // UI core
+    CardLayout cardsLayout;
+    JPanel cards;
+
+    // login inputs
+    JTextField txtUsername;
+    JPasswordField txtPassword;
+    JLabel lblLoginMessage;
+
+    // current session
+    String currentUser = null;
+    String currentRole = null;
+
+    // Date formatter
+    DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    // Tables for main panels (kept as fields for refresh)
+    DefaultTableModel userTableModel;
+    DefaultTableModel sampleTableModel;
+    DefaultTableModel resultTableModel;
+    DefaultTableModel inventoryTableModel;
+    DefaultTableModel maintenanceTableModel;
+    DefaultTableModel reservationTableModel;
+    DefaultTableModel requestTableModel;
+    DefaultTableModel logTableModel;
+
+    // Search fields
+    JTextField searchSampleField, searchResultField, searchInventoryField, searchReservationField, searchRequestField;
+
+    // optional logo path
+    String logoPath = "/mnt/data/f58bbcec-8287-4a8d-a55d-57d6a8ec5057.png";
+
+    public ResearchLabManagementSystemFull() {
+        loadAll();
+        initDemoIfEmpty();
+        initUI();
+    }
+
+    private void loadAll() {
+        users = Serializer.loadList(USERS_FILE);
+        samples = Serializer.loadList(SAMPLES_FILE);
+        results = Serializer.loadList(RESULTS_FILE);
+        inventory = Serializer.loadList(INVENTORY_FILE);
+        maintenanceLogs = Serializer.loadList(MAINT_FILE);
+        reservations = Serializer.loadList(RESERV_FILE);
+        requests = Serializer.loadList(REQUESTS_FILE);
+        logs = Serializer.loadList(LOGS_FILE);
+    }
+
+    private void saveAll() {
+        Serializer.saveList(users, USERS_FILE);
+        Serializer.saveList(samples, SAMPLES_FILE);
+        Serializer.saveList(results, RESULTS_FILE);
+        Serializer.saveList(inventory, INVENTORY_FILE);
+        Serializer.saveList(maintenanceLogs, MAINT_FILE);
+        Serializer.saveList(reservations, RESERV_FILE);
+        Serializer.saveList(requests, REQUESTS_FILE);
+        Serializer.saveList(logs, LOGS_FILE);
+    }
+
+    private void initDemoIfEmpty() {
+        if (users.isEmpty()) {
+            // create demo users: admin, tech, research
+            users.add(new User("admin", "Lab Admin", "Admin", sha256("admin123")));
+            users.add(new User("tech", "Lab Technician", "Technician", sha256("tech123")));
+            users.add(new User("research", "Lab Researcher", "Researcher", sha256("res123")));
+            saveAll();
+        }
+
+        if (inventory.isEmpty()) {
+            inventory.add(new InventoryItem(generateId("I"), "Compound A", "Chemical", 50, "Shelf 1", "Hazardous"));
+            inventory.add(new InventoryItem(generateId("I"), "Microscope 2000", "Equipment", 2, "Room 101", "Optical microscope"));
+            inventory.add(new InventoryItem(generateId("I"), "PCR Machine", "Equipment", 1, "Room 102", "For DNA amplification"));
+            saveAll();
+        }
+    }
+
+    private void initUI() {
+        setTitle("🔬 Research Lab Management System — Full");
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setSize(1100, 700);
+        setLocationRelativeTo(null);
+        setLayout(new BorderLayout());
+        setAppIcon();
+
+        cardsLayout = new CardLayout();
+        cards = new JPanel(cardsLayout);
+
+        cards.add(buildLoginPanel(), "login");
+        cards.add(buildAdminPanel(), "admin");
+        cards.add(buildTechnicianPanel(), "technician");
+        cards.add(buildResearcherPanel(), "researcher");
+
+        add(cards, BorderLayout.CENTER);
+        cardsLayout.show(cards, "login");
+    }
+
+    private void setAppIcon() {
+        try {
+            if (Files.exists(Paths.get(logoPath))) {
+                Image img = Toolkit.getDefaultToolkit().getImage(logoPath);
+                setIconImage(img);
+            }
+        } catch (Exception e) { /* ignore */ }
+    }
+
+    /* -----------------------
+       Login panel
+       ----------------------- */
+    private JPanel buildLoginPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(new Color(245, 250, 255));
+        JPanel center = new JPanel(new GridBagLayout());
+        center.setOpaque(false);
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(8,8,8,8);
+
+        JLabel title = new JLabel("🔐 Research Lab Login");
+        title.setFont(new Font("SansSerif", Font.BOLD, 28));
+        title.setForeground(new Color(20, 60, 100));
+
+        gbc.gridx=0; gbc.gridy=0; gbc.gridwidth=2;
+        center.add(title, gbc);
+
+        gbc.gridwidth=1;
+        gbc.gridx=0; gbc.gridy=1; center.add(new JLabel("Username:"), gbc);
+        txtUsername = new JTextField(18);
+        gbc.gridx=1; center.add(txtUsername, gbc);
+
+        gbc.gridx=0; gbc.gridy=2; center.add(new JLabel("Password:"), gbc);
+        txtPassword = new JPasswordField(18);
+        gbc.gridx=1; center.add(txtPassword, gbc);
+
+        JButton btnLogin = new JButton("Login");
+        btnLogin.setBackground(new Color(30,144,255));
+        btnLogin.setForeground(Color.WHITE);
+        JButton btnClear = new JButton("Clear");
+
+        JPanel btnPanel = new JPanel();
+        btnPanel.setOpaque(false);
+        btnPanel.add(btnLogin); btnPanel.add(btnClear);
+
+        gbc.gridx=0; gbc.gridy=3; gbc.gridwidth=2;
+        center.add(btnPanel, gbc);
+
+        lblLoginMessage = new JLabel("<html><small>Demo: admin/admin123 | tech/tech123 | research/res123</small></html>");
+        gbc.gridy=4; center.add(lblLoginMessage, gbc);
+
+        btnLogin.addActionListener(e -> handleLogin());
+        btnClear.addActionListener(e -> { txtUsername.setText(""); txtPassword.setText(""); });
+
+        p.add(center, BorderLayout.CENTER);
+        return p;
+    }
+
+    private void handleLogin() {
+        String user = txtUsername.getText().trim();
+        String pass = new String(txtPassword.getPassword());
+        if (user.isEmpty() || pass.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Enter username and password");
+            return;
+        }
+        Optional<User> u = users.stream().filter(x -> x.username.equalsIgnoreCase(user)).findFirst();
+        if (!u.isPresent()) {
+            JOptionPane.showMessageDialog(this, "Unknown user");
+            return;
+        }
+        User found = u.get();
+        if (!found.passwordHash.equals(sha256(pass))) {
+            JOptionPane.showMessageDialog(this, "Invalid credentials");
+            return;
+        }
+        // success
+        currentUser = found.username;
+        currentRole = found.role;
+        logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Logged in"));
+        saveAll();
+
+        // show appropriate dashboard
+        if ("Admin".equalsIgnoreCase(currentRole)) cardsLayout.show(cards, "admin");
+        else if ("Technician".equalsIgnoreCase(currentRole)) cardsLayout.show(cards, "technician");
+        else cardsLayout.show(cards, "researcher");
+
+        refreshAllTables();
+    }
+
+    /* -----------------------
+       Admin dashboard
+       ----------------------- */
+    private JPanel buildAdminPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(Color.WHITE);
+        p.add(buildTopBar("Admin Dashboard"), BorderLayout.NORTH);
+
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.addTab("Users", buildUserManagementPanel());
+        tabs.addTab("Inventory", buildInventoryPanel(true));
+        tabs.addTab("Requests", buildRequestsPanel(true));
+        tabs.addTab("Reports", buildReportsPanel());
+        tabs.addTab("Audit Logs", buildLogsPanel());
+
+        p.add(tabs, BorderLayout.CENTER);
+        return p;
+    }
+
+    /* -----------------------
+       Technician dashboard
+       ----------------------- */
+    private JPanel buildTechnicianPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(Color.WHITE);
+        p.add(buildTopBar("Technician Dashboard"), BorderLayout.NORTH);
+
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.addTab("Samples", buildSamplesPanel(false));
+        tabs.addTab("Results", buildResultsPanel(false));
+        tabs.addTab("Inventory", buildInventoryPanel(true));
+        tabs.addTab("Maintenance", buildMaintenancePanel());
+        tabs.addTab("Reservations", buildReservationsPanel(true));
+
+        p.add(tabs, BorderLayout.CENTER);
+        return p;
+    }
+
+    /* -----------------------
+       Researcher dashboard
+       ----------------------- */
+    private JPanel buildResearcherPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(Color.WHITE);
+        p.add(buildTopBar("Researcher Dashboard"), BorderLayout.NORTH);
+
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.addTab("Submit Sample", buildResearcherSamplePanel());
+        tabs.addTab("My Results", buildResearcherResultsPanel());
+        tabs.addTab("Request Equipment", buildReservationsPanel(false)); // researcher can request (not approve)
+        tabs.addTab("Requests", buildRequestsPanel(false));
+
+        p.add(tabs, BorderLayout.CENTER);
+        return p;
+    }
+
+    /* -----------------------
+       Top bar (logout/user)
+       ----------------------- */
+    private JPanel buildTopBar(String titleText) {
+        JPanel top = new JPanel(new BorderLayout());
+        top.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        JLabel title = new JLabel(titleText);
+        title.setFont(new Font("SansSerif", Font.BOLD, 20));
+        title.setForeground(new Color(10, 50, 90));
+        top.add(title, BorderLayout.WEST);
+
+        JPanel right = new JPanel();
+        right.setOpaque(false);
+        JLabel userLbl = new JLabel();
+        userLbl.setText(currentUser == null ? "Not logged in" : currentUser + " (" + currentRole + ")");
+        JButton btnLogout = new JButton("Logout");
+        btnLogout.addActionListener(e -> {
+            logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Logged out"));
+            saveAll();
+            currentUser = null; currentRole = null;
+            cardsLayout.show(cards, "login");
+        });
+        right.add(userLbl); right.add(btnLogout);
+        top.add(right, BorderLayout.EAST);
+        return top;
+    }
+
+    /* -----------------------
+       USERS management
+       ----------------------- */
+    private JPanel buildUserManagementPanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8));
+        p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+
+        String[] cols = {"Username", "Display Name", "Role"};
+        userTableModel = new DefaultTableModel(cols, 0) {
+            public boolean isCellEditable(int r,int c){return false;}
+        };
+        JTable table = new JTable(userTableModel);
+        refreshUserTable();
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnAdd = new JButton("Add User");
+        JButton btnEdit = new JButton("Edit User");
+        JButton btnDelete = new JButton("Delete User");
+        top.add(btnAdd); top.add(btnEdit); top.add(btnDelete);
+
+        btnAdd.addActionListener(e -> openUserDialog(null));
+        btnEdit.addActionListener(e -> {
+            int r = table.getSelectedRow();
+            if (r==-1) { JOptionPane.showMessageDialog(this, "Select a user"); return; }
+            String uname = (String) userTableModel.getValueAt(r,0);
+            User u = findUser(uname);
+            openUserDialog(u);
+        });
+        btnDelete.addActionListener(e -> {
+            int r = table.getSelectedRow();
+            if (r==-1) { JOptionPane.showMessageDialog(this, "Select a user"); return; }
+            String uname = (String) userTableModel.getValueAt(r,0);
+            if ("admin".equalsIgnoreCase(uname)) { JOptionPane.showMessageDialog(this, "Cannot delete default admin"); return; }
+            if (confirm("Delete user " + uname + " ?")) {
+                users.removeIf(x -> x.username.equalsIgnoreCase(uname));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Deleted user " + uname));
+                saveAll();
+                refreshUserTable();
+            }
+        });
+
+        p.add(top, BorderLayout.NORTH);
+        p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshUserTable() {
+        if (userTableModel==null) return;
+        userTableModel.setRowCount(0);
+        for (User u : users) userTableModel.addRow(new Object[]{u.username, u.displayName, u.role});
+    }
+
+    private User findUser(String username) {
+        for (User u: users) if (u.username.equalsIgnoreCase(username)) return u;
+        return null;
+    }
+
+    private void openUserDialog(User toEdit) {
+        JDialog dlg = new JDialog(this, toEdit==null ? "Add User" : "Edit User", true);
+        dlg.setSize(400,320); dlg.setLocationRelativeTo(this);
+        JPanel p = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(8,8,8,8);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        JTextField txtUser = new JTextField(20);
+        JTextField txtDisplay = new JTextField(20);
+        String[] roles = {"Admin","Technician","Researcher"};
+        JComboBox<String> cbRole = new JComboBox<>(roles);
+        JPasswordField pass = new JPasswordField(20);
+
+        if (toEdit!=null) {
+            txtUser.setText(toEdit.username); txtUser.setEditable(false);
+            txtDisplay.setText(toEdit.displayName);
+            cbRole.setSelectedItem(toEdit.role);
+        }
+
+        gbc.gridx=0; gbc.gridy=0; p.add(new JLabel("Username:"), gbc);
+        gbc.gridx=1; p.add(txtUser, gbc);
+        gbc.gridx=0; gbc.gridy=1; p.add(new JLabel("Display Name:"), gbc);
+        gbc.gridx=1; p.add(txtDisplay, gbc);
+        gbc.gridx=0; gbc.gridy=2; p.add(new JLabel("Role:"), gbc);
+        gbc.gridx=1; p.add(cbRole, gbc);
+        gbc.gridx=0; gbc.gridy=3; p.add(new JLabel("Password:"), gbc);
+        gbc.gridx=1; p.add(pass, gbc);
+
+        JButton btnSave = new JButton("Save"); JButton btnCancel = new JButton("Cancel");
+        JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel);
+        gbc.gridx=0; gbc.gridy=4; gbc.gridwidth=2; p.add(bp, gbc);
+
+        btnSave.addActionListener(e -> {
+            String uname = txtUser.getText().trim();
+            String dname = txtDisplay.getText().trim();
+            String role = (String) cbRole.getSelectedItem();
+            String pw = new String(pass.getPassword()).trim();
+            if (uname.isEmpty() || dname.isEmpty() || role.isEmpty()) { JOptionPane.showMessageDialog(dlg, "Fill required fields"); return; }
+            if (toEdit==null && users.stream().anyMatch(x->x.username.equalsIgnoreCase(uname))) { JOptionPane.showMessageDialog(dlg,"Username exists"); return; }
+            if (toEdit==null) {
+                if (pw.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Password required"); return; }
+                users.add(new User(uname, dname, role, sha256(pw)));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Added user " + uname));
+            } else {
+                toEdit.displayName = dname;
+                toEdit.role = role;
+                if (!pw.isEmpty()) toEdit.passwordHash = sha256(pw);
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Updated user " + toEdit.username));
+            }
+            saveAll();
+            refreshUserTable();
+            dlg.dispose();
+        });
+        btnCancel.addActionListener(e -> dlg.dispose());
+
+        dlg.add(p);
+        dlg.setVisible(true);
+    }
+
+    /* -----------------------
+       Inventory panel
+       ----------------------- */
+    private JPanel buildInventoryPanel(boolean fullAccess) {
+        JPanel p = new JPanel(new BorderLayout(8,8));
+        p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+
+        String[] cols = {"ID","Name","Category","Stock","Location","Notes"};
+        inventoryTableModel = new DefaultTableModel(cols,0) {
+            public boolean isCellEditable(int r,int c){return false;}
+        };
+        JTable table = new JTable(inventoryTableModel);
+        refreshInventoryTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnAdd = new JButton("Add Item");
+        JButton btnEdit = new JButton("Edit Item");
+        JButton btnDelete = new JButton("Delete Item");
+        JButton btnExport = new JButton("Export CSV");
+        searchInventoryField = new JTextField(18);
+        JButton btnSearch = new JButton("Search");
+
+        top.add(btnAdd); top.add(btnEdit); top.add(btnDelete); top.add(btnExport);
+        top.add(new JLabel("Search:")); top.add(searchInventoryField); top.add(btnSearch);
+
+        btnAdd.setEnabled(fullAccess); btnEdit.setEnabled(fullAccess); btnDelete.setEnabled(fullAccess);
+
+        btnAdd.addActionListener(e -> openInventoryDialog(null));
+        btnEdit.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select item"); return; }
+            String id = (String) inventoryTableModel.getValueAt(r,0);
+            openInventoryDialog(findInventoryItem(id));
+        });
+        btnDelete.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select item"); return; }
+            String id = (String) inventoryTableModel.getValueAt(r,0);
+            if (confirm("Delete inventory item " + id + " ?")) {
+                inventory.removeIf(x->x.id.equals(id));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Deleted inventory " + id));
+                saveAll(); refreshInventoryTable(""); 
+            }
+        });
+        btnExport.addActionListener(e -> exportInventoryCSV());
+        btnSearch.addActionListener(e -> refreshInventoryTable(searchInventoryField.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH);
+        p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshInventoryTable(String filter) {
+        if (inventoryTableModel==null) return;
+        inventoryTableModel.setRowCount(0);
+        for (InventoryItem it : inventory) {
+            String comb = (it.id + " " + it.name + " " + it.category + " " + it.location + " " + it.notes).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            inventoryTableModel.addRow(new Object[]{it.id, it.name, it.category, it.stock, it.location, it.notes});
+        }
+    }
+
+    private InventoryItem findInventoryItem(String id) {
+        for (InventoryItem it : inventory) if (it.id.equals(id)) return it;
+        return null;
+    }
+
+    private void openInventoryDialog(InventoryItem toEdit) {
+        JDialog dlg = new JDialog(this, toEdit==null ? "Add Inventory Item" : "Edit Inventory Item", true);
+        dlg.setSize(450,360); dlg.setLocationRelativeTo(this);
+        JPanel p = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints(); gbc.insets = new Insets(6,6,6,6); gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        JTextField txtId = new JTextField(18);
+        JTextField txtName = new JTextField(18);
+        JComboBox<String> cbCat = new JComboBox<>(new String[]{"Chemical","Equipment","Consumable","Other"});
+        JTextField txtStock = new JTextField(6);
+        JTextField txtLocation = new JTextField(12);
+        JTextArea txtNotes = new JTextArea(4,20);
+
+        if (toEdit!=null) {
+            txtId.setText(toEdit.id); txtId.setEditable(false);
+            txtName.setText(toEdit.name); cbCat.setSelectedItem(toEdit.category);
+            txtStock.setText(String.valueOf(toEdit.stock));
+            txtLocation.setText(toEdit.location); txtNotes.setText(toEdit.notes);
+        } else {
+            txtId.setText(generateId("I"));
+            txtStock.setText("0");
+        }
+
+        gbc.gridx=0; gbc.gridy=0; p.add(new JLabel("ID:"), gbc); gbc.gridx=1; p.add(txtId, gbc);
+        gbc.gridx=0; gbc.gridy=1; p.add(new JLabel("Name:"), gbc); gbc.gridx=1; p.add(txtName, gbc);
+        gbc.gridx=0; gbc.gridy=2; p.add(new JLabel("Category:"), gbc); gbc.gridx=1; p.add(cbCat, gbc);
+        gbc.gridx=0; gbc.gridy=3; p.add(new JLabel("Stock:"), gbc); gbc.gridx=1; p.add(txtStock, gbc);
+        gbc.gridx=0; gbc.gridy=4; p.add(new JLabel("Location:"), gbc); gbc.gridx=1; p.add(txtLocation, gbc);
+        gbc.gridx=0; gbc.gridy=5; p.add(new JLabel("Notes:"), gbc); gbc.gridx=1; p.add(new JScrollPane(txtNotes), gbc);
+
+        JButton btnSave = new JButton("Save"); JButton btnCancel = new JButton("Cancel");
+        JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel);
+        gbc.gridx=0; gbc.gridy=6; gbc.gridwidth=2; p.add(bp, gbc);
+
+        btnSave.addActionListener(e -> {
+            String id = txtId.getText().trim(); String name = txtName.getText().trim(); String cat = (String) cbCat.getSelectedItem();
+            int stock = 0;
+            try { stock = Integer.parseInt(txtStock.getText().trim()); } catch (Exception ex) { JOptionPane.showMessageDialog(dlg,"Stock invalid"); return; }
+            String loc = txtLocation.getText().trim(); String notes = txtNotes.getText().trim();
+            if (id.isEmpty() || name.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Fill required fields"); return; }
+            if (toEdit==null) {
+                inventory.add(new InventoryItem(id,name,cat,stock,loc,notes));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Added inventory " + id));
+            } else {
+                toEdit.name = name; toEdit.category = cat; toEdit.stock = stock; toEdit.location = loc; toEdit.notes = notes;
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Updated inventory " + id));
+            }
+            saveAll(); refreshInventoryTable(""); dlg.dispose();
+        });
+        btnCancel.addActionListener(e -> dlg.dispose());
+
+        dlg.add(p); dlg.setVisible(true);
+    }
+
+    private void exportInventoryCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("inventory_export.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("ID,Name,Category,Stock,Location,Notes");
+                for (InventoryItem it : inventory) {
+                    pw.printf("%s,%s,%s,%d,%s,%s%n", esc(it.id), esc(it.name), esc(it.category), it.stock, esc(it.location), esc(it.notes));
+                }
+                JOptionPane.showMessageDialog(this, "Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { ex.printStackTrace(); JOptionPane.showMessageDialog(this, "Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Samples panel (Admin/Tech)
+       ----------------------- */
+    private JPanel buildSamplesPanel(boolean readonlyForResearcher) {
+        JPanel p = new JPanel(new BorderLayout(8,8));
+        p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+
+        String[] cols = {"ID","Name","Project","Collected By","Status","Collected At"};
+        sampleTableModel = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(sampleTableModel);
+        refreshSampleTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnAdd = new JButton("Add Sample");
+        JButton btnEdit = new JButton("Edit Sample");
+        JButton btnDelete = new JButton("Delete Sample");
+        JButton btnExport = new JButton("Export CSV");
+        searchSampleField = new JTextField(18);
+        JButton btnSearch = new JButton("Search");
+
+        top.add(btnAdd); top.add(btnEdit); top.add(btnDelete); top.add(btnExport);
+        top.add(new JLabel("Search:")); top.add(searchSampleField); top.add(btnSearch);
+
+        btnAdd.setEnabled(!"Researcher".equalsIgnoreCase(currentRole));
+        btnEdit.setEnabled(!"Researcher".equalsIgnoreCase(currentRole));
+        btnDelete.setEnabled(!"Researcher".equalsIgnoreCase(currentRole));
+
+        btnAdd.addActionListener(e -> openSampleDialog(null));
+        btnEdit.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select sample"); return; }
+            String id = (String) sampleTableModel.getValueAt(r,0); openSampleDialog(findSample(id));
+        });
+        btnDelete.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select sample"); return; }
+            String id = (String) sampleTableModel.getValueAt(r,0);
+            if (confirm("Delete sample " + id + " ?")) {
+                samples.removeIf(x->x.id.equals(id));
+                results.removeIf(x->x.sampleId.equals(id));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Deleted sample " + id));
+                saveAll(); refreshSampleTable(""); refreshResultTable("");
+            }
+        });
+        btnExport.addActionListener(e -> exportSamplesCSV());
+        btnSearch.addActionListener(e -> refreshSampleTable(searchSampleField.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH);
+        p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshSampleTable(String filter) {
+        if (sampleTableModel==null) return;
+        sampleTableModel.setRowCount(0);
+        for (Sample s : samples) {
+            String comb = (s.id + " " + s.name + " " + s.project + " " + s.collectedBy + " " + s.status).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            sampleTableModel.addRow(new Object[]{s.id,s.name,s.project,s.collectedBy,s.status,s.collectedAt.format(dtf)});
+        }
+    }
+
+    private Sample findSample(String id) { for (Sample s: samples) if (s.id.equals(id)) return s; return null; }
+
+    private void openSampleDialog(Sample toEdit) {
+        JDialog dlg = new JDialog(this, toEdit==null ? "Add Sample" : "Edit Sample", true);
+        dlg.setSize(480,420); dlg.setLocationRelativeTo(this);
+        JPanel p = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints(); gbc.insets = new Insets(8,8,8,8); gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        JTextField txtId = new JTextField(16);
+        JTextField txtName = new JTextField(16);
+        JTextField txtProject = new JTextField(16);
+        JTextField txtCollectedBy = new JTextField(16);
+        JComboBox<String> cbStatus = new JComboBox<>(new String[]{"Received","In Analysis","Completed","Discarded"});
+        JTextField txtCollectedAt = new JTextField(16);
+
+        if (toEdit!=null) {
+            txtId.setText(toEdit.id); txtId.setEditable(false);
+            txtName.setText(toEdit.name); txtProject.setText(toEdit.project); txtCollectedBy.setText(toEdit.collectedBy);
+            cbStatus.setSelectedItem(toEdit.status); txtCollectedAt.setText(toEdit.collectedAt.format(dtf));
+        } else {
+            txtId.setText(generateId("S"));
+            txtCollectedBy.setText(currentUser==null?"unknown":currentUser);
+            txtCollectedAt.setText(LocalDateTime.now().format(dtf));
+        }
+
+        gbc.gridx=0; gbc.gridy=0; p.add(new JLabel("ID:"), gbc); gbc.gridx=1; p.add(txtId, gbc);
+        gbc.gridx=0; gbc.gridy=1; p.add(new JLabel("Name:"), gbc); gbc.gridx=1; p.add(txtName, gbc);
+        gbc.gridx=0; gbc.gridy=2; p.add(new JLabel("Project / Purpose:"), gbc); gbc.gridx=1; p.add(txtProject, gbc);
+        gbc.gridx=0; gbc.gridy=3; p.add(new JLabel("Collected By (username):"), gbc); gbc.gridx=1; p.add(txtCollectedBy, gbc);
+        gbc.gridx=0; gbc.gridy=4; p.add(new JLabel("Status:"), gbc); gbc.gridx=1; p.add(cbStatus, gbc);
+        gbc.gridx=0; gbc.gridy=5; p.add(new JLabel("Collected At (yyyy-MM-dd HH:mm):"), gbc); gbc.gridx=1; p.add(txtCollectedAt, gbc);
+
+        JButton btnSave = new JButton("Save"); JButton btnCancel = new JButton("Cancel");
+        JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel);
+        gbc.gridx=0; gbc.gridy=6; gbc.gridwidth=2; p.add(bp, gbc);
+
+        btnSave.addActionListener(e -> {
+            String id = txtId.getText().trim(), name = txtName.getText().trim(), proj = txtProject.getText().trim();
+            String cby = txtCollectedBy.getText().trim(), status = (String) cbStatus.getSelectedItem(), cat = txtCollectedAt.getText().trim();
+            if (id.isEmpty() || name.isEmpty() || cby.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Fill required fields"); return; }
+            LocalDateTime collectedAt;
+            try { collectedAt = LocalDateTime.parse(cat, dtf); } catch (Exception ex) { JOptionPane.showMessageDialog(dlg,"Invalid date format"); return; }
+            if (toEdit==null) {
+                samples.add(new Sample(id,name,cby,status,collectedAt,proj));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Added sample " + id));
+            } else {
+                toEdit.name = name; toEdit.project = proj; toEdit.collectedBy = cby; toEdit.status = status; toEdit.collectedAt = collectedAt;
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Updated sample " + id));
+            }
+            saveAll(); refreshSampleTable(""); dlg.dispose();
+        });
+        btnCancel.addActionListener(e -> dlg.dispose());
+
+        dlg.add(p); dlg.setVisible(true);
+    }
+
+    private void exportSamplesCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("samples_export.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("ID,Name,Project,CollectedBy,Status,CollectedAt");
+                for (Sample s : samples) pw.printf("%s,%s,%s,%s,%s,%s%n", esc(s.id), esc(s.name), esc(s.project), esc(s.collectedBy), esc(s.status), esc(s.collectedAt.format(dtf)));
+                JOptionPane.showMessageDialog(this, "Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { JOptionPane.showMessageDialog(this, "Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Results panel
+       ----------------------- */
+    private JPanel buildResultsPanel(boolean readonlyForResearcher) {
+        JPanel p = new JPanel(new BorderLayout(8,8));
+        p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        String[] cols = {"ID","Sample ID","Value","Recorded By","Recorded At","Notes"};
+        resultTableModel = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(resultTableModel);
+        refreshResultTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnAdd = new JButton("Add Result");
+        JButton btnEdit = new JButton("Edit Result");
+        JButton btnDelete = new JButton("Delete Result");
+        JButton btnExport = new JButton("Export CSV");
+        searchResultField = new JTextField(18);
+        JButton btnSearch = new JButton("Search");
+
+        top.add(btnAdd); top.add(btnEdit); top.add(btnDelete); top.add(btnExport);
+        top.add(new JLabel("Search:")); top.add(searchResultField); top.add(btnSearch);
+
+        btnAdd.setEnabled(!"Researcher".equalsIgnoreCase(currentRole));
+        btnEdit.setEnabled(!"Researcher".equalsIgnoreCase(currentRole));
+        btnDelete.setEnabled(!"Researcher".equalsIgnoreCase(currentRole));
+
+        btnAdd.addActionListener(e -> openResultDialog(null));
+        btnEdit.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select result"); return; }
+            String id = (String) resultTableModel.getValueAt(r,0); openResultDialog(findResult(id));
+        });
+        btnDelete.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select result"); return; }
+            String id = (String) resultTableModel.getValueAt(r,0); if (confirm("Delete result " + id + " ?")) {
+                results.removeIf(x->x.id.equals(id)); logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Deleted result " + id)); saveAll(); refreshResultTable(""); }
+        });
+        btnExport.addActionListener(e -> exportResultsCSV());
+        btnSearch.addActionListener(e -> refreshResultTable(searchResultField.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH);
+        p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshResultTable(String filter) {
+        if (resultTableModel==null) return;
+        resultTableModel.setRowCount(0);
+        for (Result r : results) {
+            String comb = (r.id + " " + r.sampleId + " " + r.value + " " + r.recordedBy + " " + r.notes).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            resultTableModel.addRow(new Object[]{r.id, r.sampleId, r.value, r.recordedBy, r.recordedAt.format(dtf), r.notes});
+        }
+    }
+
+    private Result findResult(String id) { for (Result r: results) if (r.id.equals(id)) return r; return null; }
+
+    private void openResultDialog(Result toEdit) {
+        JDialog dlg = new JDialog(this, toEdit==null ? "Add Result" : "Edit Result", true);
+        dlg.setSize(520,420); dlg.setLocationRelativeTo(this);
+        JPanel p = new JPanel(new GridBagLayout()); GridBagConstraints gbc = new GridBagConstraints(); gbc.insets = new Insets(8,8,8,8); gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        JTextField txtId = new JTextField(16);
+        JComboBox<String> cbSample = new JComboBox<>();
+        for (Sample s: samples) cbSample.addItem(s.id + " - " + s.name);
+        JTextField txtValue = new JTextField(18);
+        JTextField txtBy = new JTextField(16);
+        JTextField txtAt = new JTextField(16);
+        JTextArea txtNotes = new JTextArea(4,24);
+        txtAt.setToolTipText("yyyy-MM-dd HH:mm");
+
+        if (toEdit!=null) {
+            txtId.setText(toEdit.id); txtId.setEditable(false);
+            // select sample
+            for (int i=0;i<cbSample.getItemCount();i++) if (cbSample.getItemAt(i).startsWith(toEdit.sampleId)) { cbSample.setSelectedIndex(i); break; }
+            txtValue.setText(toEdit.value); txtBy.setText(toEdit.recordedBy); txtAt.setText(toEdit.recordedAt.format(dtf)); txtNotes.setText(toEdit.notes);
+        } else {
+            txtId.setText(generateId("R")); txtBy.setText(currentUser==null?"":currentUser); txtAt.setText(LocalDateTime.now().format(dtf));
+        }
+
+        gbc.gridx=0; gbc.gridy=0; p.add(new JLabel("ID:"), gbc); gbc.gridx=1; p.add(txtId, gbc);
+        gbc.gridx=0; gbc.gridy=1; p.add(new JLabel("Sample:"), gbc); gbc.gridx=1; p.add(cbSample, gbc);
+        gbc.gridx=0; gbc.gridy=2; p.add(new JLabel("Value:"), gbc); gbc.gridx=1; p.add(txtValue, gbc);
+        gbc.gridx=0; gbc.gridy=3; p.add(new JLabel("Recorded By:"), gbc); gbc.gridx=1; p.add(txtBy, gbc);
+        gbc.gridx=0; gbc.gridy=4; p.add(new JLabel("Recorded At:"), gbc); gbc.gridx=1; p.add(txtAt, gbc);
+        gbc.gridx=0; gbc.gridy=5; p.add(new JLabel("Notes:"), gbc); gbc.gridx=1; p.add(new JScrollPane(txtNotes), gbc);
+
+        JButton btnSave = new JButton("Save"); JButton btnCancel = new JButton("Cancel");
+        JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel); gbc.gridx=0; gbc.gridy=6; gbc.gridwidth=2; p.add(bp, gbc);
+
+        btnSave.addActionListener(e -> {
+            String id = txtId.getText().trim(); String sampleSel = (String) cbSample.getSelectedItem();
+            if (sampleSel==null) { JOptionPane.showMessageDialog(dlg,"No sample"); return; }
+            String sampleId = sampleSel.split(" - ")[0];
+            String val = txtValue.getText().trim(); String by = txtBy.getText().trim(); String at = txtAt.getText().trim(); String notes = txtNotes.getText().trim();
+            if (id.isEmpty() || val.isEmpty() || by.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Fill required fields"); return; }
+            LocalDateTime recordedAt;
+            try { recordedAt = LocalDateTime.parse(at, dtf); } catch (Exception ex) { JOptionPane.showMessageDialog(dlg,"Invalid date"); return; }
+            if (toEdit==null) {
+                results.add(new Result(id, sampleId, val, by, recordedAt, notes));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Added result " + id));
+            } else {
+                toEdit.sampleId = sampleId; toEdit.value = val; toEdit.recordedBy = by; toEdit.recordedAt = recordedAt; toEdit.notes = notes;
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Updated result " + id));
+            }
+            saveAll(); refreshResultTable(""); dlg.dispose();
+        });
+        btnCancel.addActionListener(e -> dlg.dispose());
+
+        dlg.add(p); dlg.setVisible(true);
+    }
+
+    private void exportResultsCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("results_export.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("ID,SampleID,Value,RecordedBy,RecordedAt,Notes");
+                for (Result r : results) pw.printf("%s,%s,%s,%s,%s,%s%n", esc(r.id), esc(r.sampleId), esc(r.value), esc(r.recordedBy), r.recordedAt.format(dtf), esc(r.notes));
+                JOptionPane.showMessageDialog(this, "Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { JOptionPane.showMessageDialog(this, "Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Maintenance logs (Technician)
+       ----------------------- */
+    private JPanel buildMaintenancePanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        String[] cols = {"ID","Equipment ID","Equipment Name","Done By","Date","Notes"};
+        maintenanceTableModel = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(maintenanceTableModel);
+        refreshMaintenanceTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnAdd = new JButton("Add Log");
+        JButton btnDelete = new JButton("Delete Log");
+        JButton btnExport = new JButton("Export CSV");
+        JTextField searchField = new JTextField(18);
+        JButton btnSearch = new JButton("Search");
+
+        top.add(btnAdd); top.add(btnDelete); top.add(btnExport); top.add(new JLabel("Search:")); top.add(searchField); top.add(btnSearch);
+
+        btnAdd.addActionListener(e -> openMaintenanceDialog(null));
+        btnDelete.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select log"); return; }
+            String id = (String) maintenanceTableModel.getValueAt(r,0);
+            if (confirm("Delete maintenance log " + id + " ?")) {
+                maintenanceLogs.removeIf(x->x.id.equals(id)); logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Deleted maintenance " + id)); saveAll(); refreshMaintenanceTable("");
+            }
+        });
+        btnExport.addActionListener(e -> exportMaintenanceCSV());
+        btnSearch.addActionListener(e -> refreshMaintenanceTable(searchField.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH); p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshMaintenanceTable(String filter) {
+        if (maintenanceTableModel==null) return;
+        maintenanceTableModel.setRowCount(0);
+        for (MaintenanceLog m : maintenanceLogs) {
+            InventoryItem it = findInventoryItem(m.equipmentId);
+            String ename = it==null?m.equipmentId:it.name;
+            String comb = (m.id + " " + ename + " " + m.doneBy + " " + m.notes).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            maintenanceTableModel.addRow(new Object[]{m.id,m.equipmentId,ename,m.doneBy,m.date.format(dtf),m.notes});
+        }
+    }
+
+    private void openMaintenanceDialog(MaintenanceLog toEdit) {
+        JDialog dlg = new JDialog(this, toEdit==null ? "Add Maintenance Log" : "Edit Maintenance Log", true);
+        dlg.setSize(500,360); dlg.setLocationRelativeTo(this);
+        JPanel p = new JPanel(new GridBagLayout()); GridBagConstraints gbc = new GridBagConstraints(); gbc.insets = new Insets(8,8,8,8); gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        JTextField txtId = new JTextField(14);
+        JComboBox<String> cbEquip = new JComboBox<>();
+        for (InventoryItem it : inventory) if ("Equipment".equalsIgnoreCase(it.category)) cbEquip.addItem(it.id + " - " + it.name);
+        JTextField txtBy = new JTextField(14);
+        JTextField txtDate = new JTextField(14);
+        JTextArea txtNotes = new JTextArea(4,24);
+
+        if (toEdit!=null) {
+            txtId.setText(toEdit.id); txtId.setEditable(false);
+            for (int i=0;i<cbEquip.getItemCount();i++) if (cbEquip.getItemAt(i).startsWith(toEdit.equipmentId)) { cbEquip.setSelectedIndex(i); break; }
+            txtBy.setText(toEdit.doneBy); txtDate.setText(toEdit.date.format(dtf)); txtNotes.setText(toEdit.notes);
+        } else {
+            txtId.setText(generateId("M")); txtBy.setText(currentUser==null?"":currentUser); txtDate.setText(LocalDateTime.now().format(dtf));
+        }
+
+        gbc.gridx=0; gbc.gridy=0; p.add(new JLabel("ID:"), gbc); gbc.gridx=1; p.add(txtId, gbc);
+        gbc.gridx=0; gbc.gridy=1; p.add(new JLabel("Equipment:"), gbc); gbc.gridx=1; p.add(cbEquip, gbc);
+        gbc.gridx=0; gbc.gridy=2; p.add(new JLabel("Done By:"), gbc); gbc.gridx=1; p.add(txtBy, gbc);
+        gbc.gridx=0; gbc.gridy=3; p.add(new JLabel("Date (yyyy-MM-dd HH:mm):"), gbc); gbc.gridx=1; p.add(txtDate, gbc);
+        gbc.gridx=0; gbc.gridy=4; p.add(new JLabel("Notes:"), gbc); gbc.gridx=1; p.add(new JScrollPane(txtNotes), gbc);
+
+        JButton btnSave = new JButton("Save"); JButton btnCancel = new JButton("Cancel");
+        JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel); gbc.gridx=0; gbc.gridy=5; gbc.gridwidth=2; p.add(bp, gbc);
+
+        btnSave.addActionListener(e -> {
+            String id = txtId.getText().trim(); String equipSel = (String) cbEquip.getSelectedItem(); String by = txtBy.getText().trim();
+            String dateStr = txtDate.getText().trim(); String notes = txtNotes.getText().trim();
+            if (id.isEmpty() || equipSel==null || by.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Fill required fields"); return; }
+            String equipId = equipSel.split(" - ")[0];
+            LocalDateTime date;
+            try { date = LocalDateTime.parse(dateStr, dtf); } catch (Exception ex) { JOptionPane.showMessageDialog(dlg,"Invalid date"); return; }
+            if (toEdit==null) {
+                maintenanceLogs.add(new MaintenanceLog(id,equipId,by,date,notes));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Added maintenance " + id));
+            } else {
+                toEdit.equipmentId = equipId; toEdit.doneBy = by; toEdit.date = date; toEdit.notes = notes;
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Updated maintenance " + id));
+            }
+            saveAll(); refreshMaintenanceTable(""); dlg.dispose();
+        });
+        btnCancel.addActionListener(e -> dlg.dispose());
+
+        dlg.add(p); dlg.setVisible(true);
+    }
+
+    private void exportMaintenanceCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("maintenance_export.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("ID,EquipmentID,DoneBy,Date,Notes");
+                for (MaintenanceLog m : maintenanceLogs) pw.printf("%s,%s,%s,%s,%s%n", esc(m.id), esc(m.equipmentId), esc(m.doneBy), m.date.format(dtf), esc(m.notes));
+                JOptionPane.showMessageDialog(this,"Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { JOptionPane.showMessageDialog(this, "Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Reservations panel
+       ----------------------- */
+    private JPanel buildReservationsPanel(boolean allowApprove) {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        String[] cols = {"ID","EquipmentID","EquipmentName","ReservedBy","Start","End","Purpose","Status"};
+        reservationTableModel = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(reservationTableModel);
+        refreshReservationTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnAdd = new JButton("Request Reservation");
+        JButton btnApprove = new JButton("Approve");
+        JButton btnReject = new JButton("Reject");
+        JButton btnDelete = new JButton("Delete");
+        JButton btnExport = new JButton("Export CSV");
+        searchReservationField = new JTextField(18);
+        JButton btnSearch = new JButton("Search");
+
+        top.add(btnAdd); top.add(btnApprove); top.add(btnReject); top.add(btnDelete); top.add(btnExport);
+        top.add(new JLabel("Search:")); top.add(searchReservationField); top.add(btnSearch);
+
+        btnApprove.setEnabled(allowApprove); btnReject.setEnabled(allowApprove);
+        btnDelete.setEnabled(allowApprove || "Technician".equalsIgnoreCase(currentRole));
+        // request / add
+        btnAdd.addActionListener(e -> openReservationDialog(null));
+        btnApprove.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select reservation"); return; }
+            String id = (String) reservationTableModel.getValueAt(r,0);
+            EquipmentReservation er = findReservation(id); if (er==null) return;
+            er.status = "Approved"; logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Approved reservation " + id));
+            saveAll(); refreshReservationTable("");
+        });
+        btnReject.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select reservation"); return; }
+            String id = (String) reservationTableModel.getValueAt(r,0);
+            EquipmentReservation er = findReservation(id); if (er==null) return;
+            er.status = "Rejected"; logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Rejected reservation " + id));
+            saveAll(); refreshReservationTable("");
+        });
+        btnDelete.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select reservation"); return; }
+            String id = (String) reservationTableModel.getValueAt(r,0);
+            if (confirm("Delete reservation " + id + " ?")) {
+                reservations.removeIf(x->x.id.equals(id)); logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Deleted reservation " + id));
+                saveAll(); refreshReservationTable("");
+            }
+        });
+        btnExport.addActionListener(e -> exportReservationsCSV());
+        btnSearch.addActionListener(e -> refreshReservationTable(searchReservationField.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH); p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshReservationTable(String filter) {
+        if (reservationTableModel==null) return;
+        reservationTableModel.setRowCount(0);
+        for (EquipmentReservation r : reservations) {
+            InventoryItem it = findInventoryItem(r.equipmentId);
+            String name = it==null? r.equipmentId : it.name;
+            String comb = (r.id + " " + name + " " + r.reservedBy + " " + r.purpose + " " + r.status).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            reservationTableModel.addRow(new Object[]{r.id, r.equipmentId, name, r.reservedBy, r.start.format(dtf), r.end.format(dtf), r.purpose, r.status});
+        }
+    }
+
+    private EquipmentReservation findReservation(String id) { for (EquipmentReservation r : reservations) if (r.id.equals(id)) return r; return null; }
+
+    private void openReservationDialog(EquipmentReservation toEdit) {
+        JDialog dlg = new JDialog(this, toEdit==null ? "Request Reservation" : "Edit Reservation", true);
+        dlg.setSize(520,420); dlg.setLocationRelativeTo(this);
+        JPanel p = new JPanel(new GridBagLayout()); GridBagConstraints gbc = new GridBagConstraints(); gbc.insets = new Insets(8,8,8,8); gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        JTextField txtId = new JTextField(14);
+        JComboBox<String> cbEquip = new JComboBox<>();
+        for (InventoryItem it : inventory) if ("Equipment".equalsIgnoreCase(it.category)) cbEquip.addItem(it.id + " - " + it.name);
+        JTextField txtBy = new JTextField(14);
+        JTextField txtStart = new JTextField(16); JTextField txtEnd = new JTextField(16);
+        JTextArea txtPurpose = new JTextArea(4,24);
+        if (toEdit!=null) {
+            txtId.setText(toEdit.id); txtId.setEditable(false);
+            for (int i=0;i<cbEquip.getItemCount();i++) if (cbEquip.getItemAt(i).startsWith(toEdit.equipmentId)) { cbEquip.setSelectedIndex(i); break; }
+            txtBy.setText(toEdit.reservedBy); txtStart.setText(toEdit.start.format(dtf)); txtEnd.setText(toEdit.end.format(dtf)); txtPurpose.setText(toEdit.purpose);
+        } else {
+            txtId.setText(generateId("ER")); txtBy.setText(currentUser==null?"":currentUser); txtStart.setText(LocalDateTime.now().format(dtf)); txtEnd.setText(LocalDateTime.now().plusHours(1).format(dtf));
+        }
+
+        gbc.gridx=0; gbc.gridy=0; p.add(new JLabel("ID:"), gbc); gbc.gridx=1; p.add(txtId, gbc);
+        gbc.gridx=0; gbc.gridy=1; p.add(new JLabel("Equipment:"), gbc); gbc.gridx=1; p.add(cbEquip, gbc);
+        gbc.gridx=0; gbc.gridy=2; p.add(new JLabel("Requested By:"), gbc); gbc.gridx=1; p.add(txtBy, gbc);
+        gbc.gridx=0; gbc.gridy=3; p.add(new JLabel("Start (yyyy-MM-dd HH:mm):"), gbc); gbc.gridx=1; p.add(txtStart, gbc);
+        gbc.gridx=0; gbc.gridy=4; p.add(new JLabel("End (yyyy-MM-dd HH:mm):"), gbc); gbc.gridx=1; p.add(txtEnd, gbc);
+        gbc.gridx=0; gbc.gridy=5; p.add(new JLabel("Purpose/Details:"), gbc); gbc.gridx=1; p.add(new JScrollPane(txtPurpose), gbc);
+
+        JButton btnSave = new JButton("Submit Request"); JButton btnCancel = new JButton("Cancel");
+        JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel); gbc.gridx=0; gbc.gridy=6; gbc.gridwidth=2; p.add(bp, gbc);
+
+        btnSave.addActionListener(e -> {
+            String id = txtId.getText().trim(); String equipSel = (String) cbEquip.getSelectedItem(); String by = txtBy.getText().trim();
+            String startS = txtStart.getText().trim(); String endS = txtEnd.getText().trim(); String purpose = txtPurpose.getText().trim();
+            if (id.isEmpty() || equipSel==null || by.isEmpty() || startS.isEmpty() || endS.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Fill required fields"); return; }
+            String equipId = equipSel.split(" - ")[0];
+            LocalDateTime start, end;
+            try { start = LocalDateTime.parse(startS, dtf); end = LocalDateTime.parse(endS, dtf); } catch (Exception ex) { JOptionPane.showMessageDialog(dlg,"Invalid date/time"); return; }
+            if (!end.isAfter(start)) { JOptionPane.showMessageDialog(dlg,"End must be after start"); return; }
+
+            // conflict detection for approved reservations
+            boolean conflict = reservations.stream().filter(r-> !r.id.equals(id) && r.equipmentId.equals(equipId) && "Approved".equalsIgnoreCase(r.status))
+                    .anyMatch(r -> timesOverlap(r.start, r.end, start, end));
+            if (conflict) {
+                int ans = JOptionPane.showConfirmDialog(dlg, "There is a scheduling conflict with an approved reservation. Submit as Pending anyway?", "Conflict", JOptionPane.YES_NO_OPTION);
+                if (ans!=JOptionPane.YES_OPTION) return;
+            }
+
+            if (toEdit==null) {
+                EquipmentReservation er = new EquipmentReservation(id, equipId, by, start, end, purpose, "Pending");
+                reservations.add(er);
+                requests.add(new RequestItem(generateId("RQ"), by, "Equipment", id, "Reservation request for " + equipId, "Pending", LocalDateTime.now()));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Requested reservation " + id));
+            } else {
+                toEdit.equipmentId = equipId; toEdit.reservedBy = by; toEdit.start = start; toEdit.end = end; toEdit.purpose = purpose;
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Updated reservation " + id));
+            }
+            saveAll(); refreshReservationTable(""); dlg.dispose();
+        });
+        btnCancel.addActionListener(e -> dlg.dispose());
+
+        dlg.add(p); dlg.setVisible(true);
+    }
+
+    private boolean timesOverlap(LocalDateTime aStart, LocalDateTime aEnd, LocalDateTime bStart, LocalDateTime bEnd) {
+        return !(aEnd.isBefore(bStart) || aStart.isAfter(bEnd) || aEnd.equals(bStart) || aStart.equals(bEnd));
+    }
+
+    private void exportReservationsCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("reservations_export.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("ID,EquipmentID,ReservedBy,Start,End,Purpose,Status");
+                for (EquipmentReservation r : reservations) pw.printf("%s,%s,%s,%s,%s,%s,%s%n", esc(r.id), esc(r.equipmentId), esc(r.reservedBy), r.start.format(dtf), r.end.format(dtf), esc(r.purpose), esc(r.status));
+                JOptionPane.showMessageDialog(this, "Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { JOptionPane.showMessageDialog(this,"Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Requests panel (Approval workflow)
+       ----------------------- */
+    private JPanel buildRequestsPanel(boolean asAdmin) {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        String[] cols = {"ID","Requested By","Type","Target","Details","Requested At","Status","Resolved By","Resolved At"};
+        requestTableModel = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(requestTableModel);
+        refreshRequestTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnApprove = new JButton("Approve");
+        JButton btnReject = new JButton("Reject");
+        JButton btnRefresh = new JButton("Refresh");
+        JButton btnExport = new JButton("Export CSV");
+        searchRequestField = new JTextField(18);
+        JButton btnSearch = new JButton("Search");
+
+        top.add(btnApprove); top.add(btnReject); top.add(btnRefresh); top.add(btnExport);
+        top.add(new JLabel("Search:")); top.add(searchRequestField); top.add(btnSearch);
+
+        btnApprove.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select request"); return; }
+            String id = (String) requestTableModel.getValueAt(r,0); RequestItem ri = findRequest(id); if (ri==null) return;
+            ri.status = "Approved"; ri.resolvedAt = LocalDateTime.now(); ri.resolvedBy = currentUser;
+            // if equipment request then mark reservation as approved
+            if ("Equipment".equalsIgnoreCase(ri.type)) {
+                // there is targetId = reservationId stored when requesting reservations
+                EquipmentReservation er = findReservation(ri.targetId);
+                if (er!=null) er.status = "Approved";
+            }
+            logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Approved request " + id));
+            saveAll(); refreshRequestTable("");
+        });
+        btnReject.addActionListener(e -> {
+            int r = table.getSelectedRow(); if (r==-1) { JOptionPane.showMessageDialog(this,"Select request"); return; }
+            String id = (String) requestTableModel.getValueAt(r,0); RequestItem ri = findRequest(id); if (ri==null) return;
+            ri.status = "Rejected"; ri.resolvedAt = LocalDateTime.now(); ri.resolvedBy = currentUser;
+            if ("Equipment".equalsIgnoreCase(ri.type)) {
+                EquipmentReservation er = findReservation(ri.targetId);
+                if (er!=null) er.status = "Rejected";
+            }
+            logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Rejected request " + id));
+            saveAll(); refreshRequestTable("");
+        });
+        btnRefresh.addActionListener(e -> refreshRequestTable(""));
+        btnExport.addActionListener(e -> exportRequestsCSV());
+        btnSearch.addActionListener(e -> refreshRequestTable(searchRequestField.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH); p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshRequestTable(String filter) {
+        if (requestTableModel==null) return;
+        requestTableModel.setRowCount(0);
+        for (RequestItem r : requests) {
+            String comb = (r.id + " " + r.requestedBy + " " + r.type + " " + r.details + " " + r.status).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            requestTableModel.addRow(new Object[]{r.id, r.requestedBy, r.type, r.targetId, r.details, r.requestedAt.format(dtf), r.status, r.resolvedBy==null?"":r.resolvedBy, r.resolvedAt==null?"": (r.resolvedAt.format(dtf))});
+        }
+    }
+
+    private RequestItem findRequest(String id) { for (RequestItem r : requests) if (r.id.equals(id)) return r; return null; }
+
+    private void exportRequestsCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("requests_export.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("ID,RequestedBy,Type,Target,Details,RequestedAt,Status,ResolvedBy,ResolvedAt");
+                for (RequestItem r : requests) {
+                    pw.printf("%s,%s,%s,%s,%s,%s,%s,%s,%s%n", esc(r.id), esc(r.requestedBy), esc(r.type), esc(r.targetId), esc(r.details), r.requestedAt.format(dtf), esc(r.status), esc(r.resolvedBy==null?"":r.resolvedBy), r.resolvedAt==null?"":r.resolvedAt.format(dtf));
+                }
+                JOptionPane.showMessageDialog(this,"Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { JOptionPane.showMessageDialog(this,"Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Reports and logs
+       ----------------------- */
+    private JPanel buildReportsPanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        JTextArea area = new JTextArea(); area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12)); area.setEditable(false);
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnSummary = new JButton("Generate Summary");
+        JButton btnExportHTML = new JButton("Export Summary HTML");
+        top.add(btnSummary); top.add(btnExportHTML);
+
+        btnSummary.addActionListener(e -> {
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== Lab Summary ===\n");
+            sb.append("Total Users: ").append(users.size()).append("\n");
+            Map<String, Long> byRole = users.stream().collect(Collectors.groupingBy(x->x.role, Collectors.counting()));
+            sb.append("Users by Role:\n"); for (String k : byRole.keySet()) sb.append("  ").append(k).append(": ").append(byRole.get(k)).append("\n");
+            sb.append("\nSamples: ").append(samples.size()).append("\n");
+            Map<String, Long> byStatus = samples.stream().collect(Collectors.groupingBy(x->x.status, Collectors.counting()));
+            sb.append("Samples by status:\n"); for (String k: byStatus.keySet()) sb.append("  ").append(k).append(": ").append(byStatus.get(k)).append("\n");
+            sb.append("\nInventory items: ").append(inventory.size()).append("\n");
+            sb.append("\nReservations: ").append(reservations.size()).append("\n");
+            sb.append("\nRequests: ").append(requests.size()).append("\n");
+            sb.append("\nLogs (last 20):\n");
+            int n = Math.max(0, logs.size()-20);
+            for (int i = logs.size()-1; i>=n; i--) {
+                AuditLog L = logs.get(i);
+                sb.append(L.time.format(dtf)).append(" | ").append(L.user).append(" | ").append(L.action).append("\n");
+            }
+            area.setText(sb.toString());
+        });
+
+        btnExportHTML.addActionListener(e -> {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setSelectedFile(new File("lab_summary.html"));
+            if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+                File f = chooser.getSelectedFile();
+                try (PrintWriter pw = new PrintWriter(f)) {
+                    pw.println("<html><body><pre>");
+                    pw.println(area.getText().replace("&","&amp;").replace("<","&lt;"));
+                    pw.println("</pre></body></html>");
+                    JOptionPane.showMessageDialog(this,"Exported to " + f.getAbsolutePath() + "\nOpen in browser and print-to-PDF if needed.");
+                } catch (Exception ex) { JOptionPane.showMessageDialog(this, "Export failed: " + ex.getMessage()); }
+            }
+        });
+
+        p.add(top, BorderLayout.NORTH); p.add(new JScrollPane(area), BorderLayout.CENTER);
+        return p;
+    }
+
+    private JPanel buildLogsPanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        String[] cols = {"Time","User","Action"};
+        logTableModel = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(logTableModel);
+        refreshLogTable("");
+
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton btnRefresh = new JButton("Refresh"); JButton btnExport = new JButton("Export CSV");
+        JTextField search = new JTextField(20);
+        JButton btnSearch = new JButton("Search");
+        top.add(btnRefresh); top.add(btnExport); top.add(new JLabel("Search:")); top.add(search); top.add(btnSearch);
+        btnRefresh.addActionListener(e -> refreshLogTable(search.getText().trim()));
+        btnExport.addActionListener(e -> exportLogsCSV());
+        btnSearch.addActionListener(e -> refreshLogTable(search.getText().trim()));
+
+        p.add(top, BorderLayout.NORTH); p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshLogTable(String filter) {
+        if (logTableModel==null) return;
+        logTableModel.setRowCount(0);
+        for (AuditLog L : logs) {
+            String comb = (L.user + " " + L.action).toLowerCase();
+            if (!filter.isEmpty() && !comb.contains(filter.toLowerCase())) continue;
+            logTableModel.addRow(new Object[]{L.time.format(dtf), L.user, L.action});
+        }
+    }
+
+    private void exportLogsCSV() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File("audit_logs.csv"));
+        if (chooser.showSaveDialog(this)==JFileChooser.APPROVE_OPTION) {
+            File f = chooser.getSelectedFile();
+            try (PrintWriter pw = new PrintWriter(f)) {
+                pw.println("Time,User,Action");
+                for (AuditLog L : logs) pw.printf("%s,%s,%s%n", L.time.format(dtf), esc(L.user), esc(L.action));
+                JOptionPane.showMessageDialog(this,"Exported to " + f.getAbsolutePath());
+            } catch (Exception ex) { JOptionPane.showMessageDialog(this,"Export failed: " + ex.getMessage()); }
+        }
+    }
+
+    /* -----------------------
+       Researcher sample submit & view
+       ----------------------- */
+    private JPanel buildResearcherSamplePanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        // reuse sample creation but simplified for researchers
+        JButton btnSubmit = new JButton("Submit Sample");
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT)); top.add(btnSubmit);
+        p.add(top, BorderLayout.NORTH);
+
+        String[] cols = {"ID","Name","Project","Collected By","Status","Collected At"};
+        DefaultTableModel model = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(model);
+        for (Sample s : samples) model.addRow(new Object[]{s.id,s.name,s.project,s.collectedBy,s.status,s.collectedAt.format(dtf)});
+        p.add(new JScrollPane(table), BorderLayout.CENTER);
+
+        btnSubmit.addActionListener(e -> {
+            // open quick submission dialog
+            JDialog dlg = new JDialog(this, "Submit Sample", true);
+            dlg.setSize(440,320); dlg.setLocationRelativeTo(this);
+            JPanel cp = new JPanel(new GridBagLayout()); GridBagConstraints gbc = new GridBagConstraints(); gbc.insets = new Insets(8,8,8,8); gbc.fill = GridBagConstraints.HORIZONTAL;
+            JTextField txtId = new JTextField(generateId("S"),12);
+            JTextField txtName = new JTextField(18);
+            JTextField txtProject = new JTextField(18);
+            JTextField txtCollectedBy = new JTextField(currentUser,12);
+            JComboBox<String> cbStatus = new JComboBox<>(new String[]{"Received","In Analysis","Completed","Discarded"});
+            JTextField txtAt = new JTextField(LocalDateTime.now().format(dtf),14);
+
+            gbc.gridx=0; gbc.gridy=0; cp.add(new JLabel("ID:"), gbc); gbc.gridx=1; cp.add(txtId, gbc);
+            gbc.gridx=0; gbc.gridy=1; cp.add(new JLabel("Name:"), gbc); gbc.gridx=1; cp.add(txtName, gbc);
+            gbc.gridx=0; gbc.gridy=2; cp.add(new JLabel("Project:"), gbc); gbc.gridx=1; cp.add(txtProject, gbc);
+            gbc.gridx=0; gbc.gridy=3; cp.add(new JLabel("Submitted By:"), gbc); gbc.gridx=1; cp.add(txtCollectedBy, gbc);
+            gbc.gridx=0; gbc.gridy=4; cp.add(new JLabel("Status:"), gbc); gbc.gridx=1; cp.add(cbStatus, gbc);
+            gbc.gridx=0; gbc.gridy=5; cp.add(new JLabel("Collected At:"), gbc); gbc.gridx=1; cp.add(txtAt, gbc);
+
+            JButton btnSave = new JButton("Submit"); JButton btnCancel = new JButton("Cancel");
+            JPanel bp = new JPanel(); bp.add(btnSave); bp.add(btnCancel); gbc.gridx=0; gbc.gridy=6; gbc.gridwidth=2; cp.add(bp, gbc);
+
+            btnSave.addActionListener(ae -> {
+                String id = txtId.getText().trim(), name = txtName.getText().trim(), proj = txtProject.getText().trim(), collectedBy = txtCollectedBy.getText().trim(), status = (String) cbStatus.getSelectedItem(), at = txtAt.getText().trim();
+                if (id.isEmpty() || name.isEmpty() || collectedBy.isEmpty()) { JOptionPane.showMessageDialog(dlg,"Fill required fields"); return; }
+                LocalDateTime collectedAt; try { collectedAt = LocalDateTime.parse(at, dtf); } catch (Exception ex) { JOptionPane.showMessageDialog(dlg,"Invalid date"); return; }
+                samples.add(new Sample(id,name,collectedBy,status,collectedAt,proj));
+                logs.add(new AuditLog(LocalDateTime.now(), currentUser, "Submitted sample " + id));
+                saveAll(); model.addRow(new Object[]{id,name,proj,collectedBy,status,collectedAt.format(dtf)});
+                dlg.dispose();
+            });
+            btnCancel.addActionListener(ae -> dlg.dispose());
+            dlg.add(cp); dlg.setVisible(true);
+        });
+
+        return p;
+    }
+
+    private JPanel buildResearcherResultsPanel() {
+        JPanel p = new JPanel(new BorderLayout(8,8)); p.setBorder(BorderFactory.createEmptyBorder(8,8,8,8));
+        String[] cols = {"ID","Sample ID","Value","Recorded By","Recorded At","Notes"};
+        DefaultTableModel model = new DefaultTableModel(cols,0) { public boolean isCellEditable(int r,int c){return false;} };
+        JTable table = new JTable(model);
+        for (Result r : results) model.addRow(new Object[]{r.id,r.sampleId,r.value,r.recordedBy,r.recordedAt.format(dtf),r.notes});
+        p.add(new JScrollPane(table), BorderLayout.CENTER);
+        return p;
+    }
+
+    /* -----------------------
+       Utilities
+       ----------------------- */
+    private String generateId(String prefix) {
+        return prefix + "-" + (System.currentTimeMillis() % 100000) + "-" + (int)(Math.random()*900 + 100);
+    }
+
+    private boolean confirm(String msg) {
+        return JOptionPane.showConfirmDialog(this, msg, "Confirm", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION;
+    }
+
+    private static String esc(String s) { if (s==null) return ""; return s.replace(",",";").replace("\n"," "); }
+
+    private static String sha256(String text) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] b = md.digest(text.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte x : b) sb.append(String.format("%02x", x));
+            return sb.toString();
+        } catch (Exception ex) { return text; }
+    }
+
+    private static String generateSampleHTMLRow(Sample s) {
+        return "<tr><td>" + s.id + "</td><td>" + s.name + "</td><td>" + s.project + "</td><td>" + s.collectedBy + "</td><td>" + s.status + "</td><td>" + s.collectedAt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")) + "</td></tr>";
+    }
+
+    private void refreshAllTables() {
+        refreshUserTable();
+        refreshInventoryTable("");
+        refreshSampleTable("");
+        refreshResultTable("");
+        refreshMaintenanceTable("");
+        refreshReservationTable("");
+        refreshRequestTable("");
+        refreshLogTable("");
+    }
+
+    /* --------------------------------
+       Main entry point
+       -------------------------------- */
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            ResearchLabManagementSystemFull app = new ResearchLabManagementSystemFull();
+            app.setVisible(true);
+        });
+    }
+}
